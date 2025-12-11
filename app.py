@@ -73,9 +73,13 @@ if __name__ == '__main__':
     host = os.getenv('FLASK_HOST', '0.0.0.0')
     port = int(os.getenv('FLASK_PORT', 5000))
     debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    use_reloader = os.getenv('FLASK_NO_RELOAD', 'False').lower() != 'true'  # Disable if FLASK_NO_RELOAD=true
 
     print(f"Starting Hub-and-Spoke Automation API...")
     print(f"Server running on http://{host}:{port}")
     print(f"Debug mode: {debug}")
+    print(f"Auto-reload: {use_reloader}")
+    if not use_reloader:
+        print("⚠️  Auto-reload DISABLED - Background rollback threads will complete successfully")
 
-    app.run(host=host, port=port, debug=debug)
+    app.run(host=host, port=port, debug=debug, use_reloader=use_reloader)

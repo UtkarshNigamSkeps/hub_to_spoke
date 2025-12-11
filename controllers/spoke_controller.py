@@ -142,23 +142,83 @@ class SpokeController:
         List all deployed spokes
 
         Args:
-            status_filter: Filter by status (optional)
+            status_filter: Filter by deployment status: 'completed', 'failed', 'in_progress', 'pending', 'rolling_back'
             limit: Maximum number of results (optional)
 
         Returns:
             List of spoke information dictionaries
         """
         try:
-            self.logger.debug("Listing all spokes")
+            self.logger.debug(f"Listing all spokes (filter: {status_filter})")
 
-            # Get all spokes from orchestrator
-            spokes = self.orchestrator.list_all_spokes()
+            # Get spokes from both sources
+            # 1. From Azure (only shows successfully deployed spokes)
+            azure_spokes = self.orchestrator.list_all_spokes()
 
-            # Apply status filter if provided
+            # 2. From storage (shows all deployment attempts including failed)
+            stored_deployments = self.storage_service.list_deployments()
+
+            # Merge results, prioritizing Azure data for existing spokes
+            spoke_map = {}
+
+            # Add Azure spokes
+            for spoke in azure_spokes:
+                spoke_id = spoke.get('spoke_id')
+                spoke_map[spoke_id] = spoke
+
+            # Add or update with storage data (for failed/in-progress deployments)
+            for deployment in stored_deployments:
+                # Skip if deployment is None or empty
+                if not deployment:
+                    continue
+
+                spoke_id = deployment.get('spoke_id')
+                if not spoke_id:
+                    continue
+
+                deployment_status = deployment.get('status')
+
+                # If spoke exists in Azure and is completed, keep Azure data
+                if spoke_id in spoke_map and deployment_status == 'completed':
+                    # Add deployment status to Azure data
+                    spoke_map[spoke_id]['deployment_status'] = deployment_status
+                else:
+                    # Use storage data (for failed/in-progress/pending)
+                    spoke_map[spoke_id] = {
+                        'spoke_id': spoke_id,
+                        'exists': False,
+                        'deployment_status': deployment_status,
+                        'vnet': {
+                            'name': deployment.get('vnet_name'),
+                            'id': deployment.get('vnet_id')
+                        } if deployment.get('vnet_name') else None,
+                        'vm': {
+                            'name': deployment.get('vm_name'),
+                            'status': 'unknown',
+                            'private_ip': deployment.get('vm_private_ip')
+                        } if deployment.get('vm_name') else None,
+                        'error_message': deployment.get('error_message'),
+                        'failed_step': deployment.get('failed_step'),
+                        'created_at': deployment.get('created_at'),
+                        'updated_at': deployment.get('updated_at')
+                    }
+
+            # Convert to list
+            spokes = list(spoke_map.values())
+
+            # Apply status filter if provided (deployment status only)
             if status_filter:
+                valid_statuses = ['completed', 'failed', 'in_progress', 'pending', 'rolling_back']
+
+                if status_filter not in valid_statuses:
+                    self.logger.warning(f"Invalid status filter: {status_filter}. Valid values: {valid_statuses}")
+                    # Return empty list for invalid status
+                    return []
+
+                # Filter by deployment status
                 spokes = [
                     spoke for spoke in spokes
-                    if spoke.get('vm', {}).get('status') == status_filter
+                    if spoke.get('deployment_status') == status_filter
                 ]
 
             # Apply limit if provided
@@ -259,10 +319,11 @@ class SpokeController:
                     'spoke_id': spoke_id,
                     'rollback_status': 'completed' if success else 'failed',
                     'removed_resources': [
+                        'virtual_machine',
+                        'os_disk',
+                        'network_interface',
                         'vnet',
                         'subnets',
-                        'network_interface',
-                        'virtual_machine',
                         'application_gateway_backend_pool'
                     ]
                 }

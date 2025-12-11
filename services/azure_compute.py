@@ -380,17 +380,23 @@ class AzureComputeService:
             self.logger.error(f"Error getting VM status: {e}")
             return None
 
-    def delete_vm(self, vm_name: str) -> bool:
+    def delete_vm(self, vm_name: str, wait_timeout: int = 600) -> bool:
         """
         Delete VM (for rollback)
 
         Args:
             vm_name: Name of VM to delete
+            wait_timeout: Maximum time to wait for deletion (default: 10 minutes)
 
         Returns:
             True if deleted successfully
         """
         try:
+            # Check if VM exists first
+            if not self._vm_exists(vm_name):
+                self.logger.warning(f"VM {vm_name} does not exist, skipping deletion")
+                return True
+
             self.logger.warning(f"Deleting VM: {vm_name}")
 
             poller = self.compute_client.virtual_machines.begin_delete(
@@ -398,46 +404,119 @@ class AzureComputeService:
                 vm_name=vm_name
             )
 
-            poller.result()
+            # Wait for deletion to complete with timeout
+            poller.result(timeout=wait_timeout)
             self.logger.info(f"✓ VM deleted: {vm_name}")
+
+            # Verify deletion
+            if not self._vm_exists(vm_name):
+                return True
+            else:
+                self.logger.error(f"VM {vm_name} still exists after deletion attempt")
+                return False
+
+        except ResourceNotFoundError:
+            # VM already deleted
+            self.logger.info(f"VM {vm_name} already deleted")
             return True
 
         except Exception as e:
-            self.logger.error(f"Error deleting VM {vm_name}: {e}")
+            self.logger.error(f"Error deleting VM {vm_name}: {e}", exc_info=True)
             return False
 
-    def delete_nic(self, nic_name: str) -> bool:
+    def delete_nic(self, nic_name: str, wait_timeout: int = 300, max_retries: int = 3) -> bool:
         """
         Delete network interface (for rollback)
 
         Args:
             nic_name: Name of NIC to delete
+            wait_timeout: Maximum time to wait for deletion (default: 5 minutes)
+            max_retries: Maximum number of retry attempts (default: 3)
 
         Returns:
             True if deleted successfully
         """
+        import time
+
         try:
+            # Check if NIC exists first
+            if not self._nic_exists(nic_name):
+                self.logger.warning(f"NIC {nic_name} does not exist, skipping deletion")
+                return True
+
             self.logger.warning(f"Deleting NIC: {nic_name}")
 
-            poller = self.network_client.network_interfaces.begin_delete(
-                resource_group_name=self.settings.RESOURCE_GROUP_NAME,
-                network_interface_name=nic_name
-            )
+            # Retry loop with exponential backoff
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        # Wait before retry (exponential backoff: 10s, 20s, 40s)
+                        wait_time = 10 * (2 ** (attempt - 1))
+                        self.logger.info(f"Retry attempt {attempt + 1}/{max_retries} after {wait_time}s wait...")
+                        time.sleep(wait_time)
 
-            poller.result()
-            self.logger.info(f"✓ NIC deleted: {nic_name}")
+                    poller = self.network_client.network_interfaces.begin_delete(
+                        resource_group_name=self.settings.RESOURCE_GROUP_NAME,
+                        network_interface_name=nic_name
+                    )
+
+                    # Wait for deletion to complete with timeout
+                    poller.result(timeout=wait_timeout)
+                    self.logger.info(f"✓ NIC deleted: {nic_name}")
+
+                    # Verify deletion
+                    if not self._nic_exists(nic_name):
+                        return True
+                    else:
+                        self.logger.error(f"NIC {nic_name} still exists after deletion attempt")
+                        if attempt < max_retries - 1:
+                            continue
+                        return False
+
+                except HttpResponseError as e:
+                    error_msg = str(e)
+
+                    # Check for "NIC reserved for VM" error (180 second reservation)
+                    if "NicReservedForAnotherVm" in error_msg:
+                        if attempt < max_retries - 1:
+                            # Azure reserves NIC for 180 seconds after failed VM creation
+                            self.logger.warning(f"NIC {nic_name} reserved by Azure (180s hold from failed VM creation)")
+                            self.logger.warning(f"Will wait longer before retrying...")
+                            # Override normal backoff with longer wait
+                            time.sleep(60)  # Wait 60 seconds for reservation to release
+                            continue
+                        else:
+                            self.logger.error(f"NIC {nic_name} still reserved after {max_retries} attempts")
+                            self.logger.error(f"Azure holds NIC for 180s after failed VM creation - please wait and retry manually")
+                            return False
+
+                    # Check if it's a "still in use" error
+                    if "InUseSubnetCannotBeDeleted" in error_msg or "NicInUse" in error_msg or "InUse" in error_msg:
+                        if attempt < max_retries - 1:
+                            self.logger.warning(f"NIC {nic_name} still in use, will retry...")
+                            continue
+                        else:
+                            self.logger.error(f"NIC {nic_name} still in use after {max_retries} attempts")
+                            return False
+                    else:
+                        raise
+
+        except ResourceNotFoundError:
+            # NIC already deleted
+            self.logger.info(f"NIC {nic_name} already deleted")
             return True
 
         except Exception as e:
-            self.logger.error(f"Error deleting NIC {nic_name}: {e}")
+            self.logger.error(f"Error deleting NIC {nic_name}: {e}", exc_info=True)
             return False
 
-    def delete_disk(self, disk_name: str) -> bool:
+    def delete_disk(self, disk_name: str, wait_timeout: int = 300) -> bool:
         """
         Delete managed disk (for rollback)
 
         Args:
             disk_name: Name of disk to delete
+            wait_timeout: Maximum time to wait for deletion (default: 5 minutes)
 
         Returns:
             True if deleted successfully
@@ -450,12 +529,18 @@ class AzureComputeService:
                 disk_name=disk_name
             )
 
-            poller.result()
+            # Wait for deletion to complete with timeout
+            poller.result(timeout=wait_timeout)
             self.logger.info(f"✓ Disk deleted: {disk_name}")
             return True
 
+        except ResourceNotFoundError:
+            # Disk already deleted or doesn't exist
+            self.logger.info(f"Disk {disk_name} already deleted or does not exist")
+            return True
+
         except Exception as e:
-            self.logger.error(f"Error deleting disk {disk_name}: {e}")
+            self.logger.error(f"Error deleting disk {disk_name}: {e}", exc_info=True)
             return False
 
     # Private helper methods

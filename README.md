@@ -12,6 +12,11 @@ Automated REST API for deploying Azure Hub-and-Spoke network architectures with 
 - [Quick Start](#quick-start)
 - [Docker Deployment](#docker-deployment)
 - [Technologies](#technologies)
+- [Key Features](#key-features)
+- [Storage](#storage)
+- [Rollback & Error Handling](#rollback--error-handling)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
 
 ---
 
@@ -20,10 +25,11 @@ Automated REST API for deploying Azure Hub-and-Spoke network architectures with 
 This Flask-based automation service dynamically creates spoke VNets in a hub-and-spoke architecture. Each spoke includes:
 - Dedicated VNet (`10.11.X.0/24`) with auto-calculated CIDR blocks
 - 4 subnets (VM, Database, KeyVault, Workspace) - each `/26` subnet
-- Linux VM (Ubuntu 22.04) with SSH key authentication
+- Linux VM (Ubuntu 22.04 LTS) with SSH key authentication
 - Automatic bidirectional VNet peering with Hub
 - Application Gateway backend pool configuration
 - Persistent deployment tracking with JSON storage
+- **Intelligent rollback** with proper resource dependency handling
 
 ---
 
@@ -96,9 +102,9 @@ This Flask-based automation service dynamically creates spoke VNets in a hub-and
         ▼         ▼           ▼                 ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    AZURE CLOUD                              │
-│  - Virtual Networks  - Virtual Machines                     │
-│  - Subnets          - Application Gateway                   │
-│  - VNet Peering     - Network Interfaces                    │
+│  - Virtual Networks      - Virtual Machines                 │
+│  - Subnets              - Application Gateway               │
+│  - VNet Peering         - Network Interfaces                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -122,7 +128,7 @@ This Flask-based automation service dynamically creates spoke VNets in a hub-and
     └─ Create NIC in VM subnet
 
 5.  Deploy Virtual Machine
-    └─ Deploy Ubuntu 22.04 VM with SSH key
+    └─ Deploy Ubuntu 22.04 LTS VM with SSH key
 
 6.  Wait for VM Ready
     └─ Poll VM status until running
@@ -142,10 +148,31 @@ This Flask-based automation service dynamically creates spoke VNets in a hub-and
 11. Save to Storage
     └─ Persist deployment status to JSON file
 
-    ┌────────────────────────────────────┐
-    │    On Failure: Automatic Rollback  │
-    │    (if ENABLE_ROLLBACK=true)       │
-    └────────────────────────────────────┘
+    ┌────────────────────────────────────────────────────────┐
+    │    On Failure: Asynchronous Rollback                  │
+    │    (if ENABLE_ROLLBACK=true)                           │
+    │                                                        │
+    │    1. API returns error immediately (~30-60s)         │
+    │    2. Background thread starts rollback               │
+    │    3. Status: failed → rolling_back → rolled_back     │
+    │                                                        │
+    │    Rollback Order (respects dependencies):            │
+    │    1. Application Gateway backend pool                │
+    │    2. Virtual Machine (waits for completion)          │
+    │    3. OS Disk (only if VM deleted)                    │
+    │    4. Network Interface (5 retries, 60s waits)        │
+    │    5. VNet (attempts even if NIC fails)               │
+    └────────────────────────────────────────────────────────┘
+```
+
+**Deployment Status Values:**
+- `pending` - Not yet started
+- `in_progress` - Currently deploying
+- `completed` - Deployment successful
+- `failed` - Deployment failed (before rollback starts)
+- `rolling_back` - Automatic rollback in progress (background)
+- `rolled_back` - Rollback completed successfully
+- `rollback_failed` - Rollback encountered errors (manual cleanup may be needed)
 ```
 
 ### 4. Data Flow
@@ -299,7 +326,7 @@ progress = status.get_progress_percentage()  # Returns 0-100
 
 **Key Methods:**
 - `create_spoke(spoke_config)`: Main deployment method (11 steps)
-- `rollback_spoke(spoke_config, deployment_status)`: Remove created resources
+- `rollback_spoke(spoke_config, deployment_status)`: Intelligent resource removal with dependency handling
 - `get_spoke_status(spoke_id)`: Get current status from Azure
 - `list_all_spokes()`: List all deployed spokes
 - `_execute_step(status, step_name, func, *args)`: Execute step with tracking
@@ -329,12 +356,19 @@ deployment_status = orchestrator.create_spoke(spoke_config)
 
 **Key Methods:**
 - `create_network_interface(nic_name, subnet_id, spoke_id)`: Create NIC in subnet
-- `create_virtual_machine(spoke_config, nic_id)`: Deploy Ubuntu VM
+- `create_virtual_machine(spoke_config, nic_id)`: Deploy Ubuntu 22.04 LTS VM
 - `wait_for_vm_ready(vm_name)`: Poll until VM is running
 - `get_vm_private_ip(vm_name)`: Retrieve VM's private IP
 - `get_vm_status(vm_name)`: Get current VM power state
-- `delete_vm(vm_name)`: Delete VM (for rollback)
-- `delete_nic(nic_name)`: Delete network interface
+- `delete_vm(vm_name, wait_timeout)`: Delete VM with timeout and verification
+- `delete_nic(nic_name, wait_timeout)`: Delete NIC with timeout and verification
+- `delete_disk(disk_name, wait_timeout)`: Delete managed disk with timeout
+
+**Improvements:**
+- All deletion methods now wait for completion before returning
+- Existence checks before attempting deletion
+- Verification after deletion to ensure resource is removed
+- Proper handling of ResourceNotFoundError
 
 **Dependencies:** Azure ComputeManagementClient
 
@@ -653,10 +687,25 @@ curl -X GET http://localhost:5000/api/spokes
 
 ### 6. List Spokes with Filters
 
-**Filter by Status:**
+**Filter by Deployment Status:**
 ```bash
-curl -X GET "http://localhost:5000/api/spokes?status=running"
+# Get all failed deployments
+curl -X GET "http://localhost:5000/api/spokes?status=failed"
+
+# Get all completed deployments
+curl -X GET "http://localhost:5000/api/spokes?status=completed"
+
+# Get in-progress deployments
+curl -X GET "http://localhost:5000/api/spokes?status=in_progress"
+
+# Get pending deployments
+curl -X GET "http://localhost:5000/api/spokes?status=pending"
+
+# Get deployments that are rolling back
+curl -X GET "http://localhost:5000/api/spokes?status=rolling_back"
 ```
+
+**Valid status values:** `completed`, `failed`, `in_progress`, `pending`, `rolling_back`
 
 **Limit Results:**
 ```bash
@@ -665,7 +714,7 @@ curl -X GET "http://localhost:5000/api/spokes?limit=5"
 
 **Combine Filters:**
 ```bash
-curl -X GET "http://localhost:5000/api/spokes?status=running&limit=10"
+curl -X GET "http://localhost:5000/api/spokes?status=failed&limit=10"
 ```
 
 ---
@@ -878,10 +927,10 @@ docker stats
 
 ## Key Features
 
-✅ **Automated Deployment** - Single API call creates complete infrastructure
+✅ **Automated Deployment** - Single API call creates complete infrastructure (11 steps)
 ✅ **Progress Tracking** - Real-time status with 11-step workflow
 ✅ **Persistent Storage** - JSON file storage survives restarts
-✅ **Automatic Rollback** - Removes resources on failure (configurable)
+✅ **Intelligent Rollback** - Removes resources with proper dependency handling
 ✅ **Structured Logging** - Context-aware logs with spoke_id
 ✅ **Input Validation** - Comprehensive validation (spoke_id, CIDR, SSH keys, VM size)
 ✅ **Security** - Non-root container, SSH keys, no hardcoded secrets
@@ -889,6 +938,8 @@ docker stats
 ✅ **RESTful API** - Standard HTTP methods and JSON responses
 ✅ **Error Handling** - Detailed error messages and status codes
 ✅ **Docker Support** - One-command deployment
+✅ **Ubuntu 22.04 LTS** - Latest long-term support Ubuntu release
+✅ **Retry Logic** - Exponential backoff for NIC deletion with 3 attempts
 
 ---
 
@@ -930,6 +981,166 @@ Deployments are persisted to `storage/deployments.json`:
   ]
 }
 ```
+
+---
+
+## Rollback & Error Handling
+
+### Intelligent Rollback System
+
+The system features an **asynchronous** rollback mechanism that runs in the background when deployments fail. This ensures fast API responses while properly cleaning up resources.
+
+#### Asynchronous Behavior
+
+**When deployment fails:**
+1. API returns error response immediately (~30-60 seconds after failure)
+2. Rollback starts automatically in background thread
+3. Client polls `GET /api/spokes/{id}` to check rollback progress
+4. Status transitions: `failed` → `rolling_back` → `rolled_back` or `rollback_failed`
+
+**API Response on Failure:**
+```json
+{
+  "status": "error",
+  "message": "Deployment failed: ...",
+  "rollback_status": "queued",
+  "note": "Automatic rollback is running in background. Check status: GET /api/spokes/2"
+}
+```
+
+#### Rollback Process
+
+**Rollback Order:**
+1. **Application Gateway** - Remove backend pool first (no dependencies)
+2. **Virtual Machine** - Delete and wait for completion (10 min timeout)
+3. **OS Disk** - Only if VM deletion succeeded
+4. **Network Interface** - Always check if NIC exists (even if not in completed steps)
+   - Wait 15s after VM deletion if VM existed
+   - Retry up to 5 times with 60s waits (handles Azure's 180s NIC reservation)
+   - Detect and clean up orphan NICs from partial deployments
+5. **VNet & Subnets** - Attempt deletion even if NIC has issues (will fail gracefully with detailed error)
+
+**Key Features:**
+- ✅ **Asynchronous Execution**: Runs in background, doesn't block API response
+- ✅ **Dependency Tracking**: Tracks success of each deletion before proceeding
+- ✅ **Timeout Handling**: Each resource has appropriate deletion timeout
+- ✅ **Verification**: Verifies resources are actually deleted, not just assumed
+- ✅ **Orphan Resource Detection**: Checks for resources that exist but weren't marked as "completed" (partial deployments)
+- ✅ **Azure NIC Reservation Handling**: Waits out Azure's 180-second NIC reservation after failed VM creation
+- ✅ **Graceful Failures**: Attempts VNet deletion even if NIC fails, with clear error messages
+- ✅ **Error Collection**: Collects all errors and saves to deployment status for visibility
+- ✅ **Thread Safety**: Uses daemon threads that don't block application shutdown
+
+**Example Rollback Flow (Partial Deployment - Async):**
+```
+Client: POST /api/spokes {"spoke_id": 2, ...}
+├─ Server: VNet created ✓
+├─ Server: Subnets created ✓
+├─ Server: NIC created ✓
+├─ Server: VM creation fails (quota exceeded) ✗
+├─ Server: Queues async rollback in background thread
+└─ Response (after ~30 seconds): {
+    "status": "error",
+    "message": "Deployment failed: quota exceeded",
+    "rollback_status": "queued",
+    "note": "Check status: GET /api/spokes/2"
+  }
+
+Background Rollback Thread (runs for ~3-5 minutes):
+├─ Check NIC (not in completed steps but exists - orphan)
+├─ Delete NIC Attempt 1 → Fails (NicReservedForAnotherVm - Azure 180s hold)
+├─ Wait 60 seconds...
+├─ Delete NIC Attempt 2 → Fails (still reserved)
+├─ Wait 60 seconds...
+├─ Delete NIC Attempt 3 → Fails (still reserved)
+├─ Wait 60 seconds...
+├─ Delete NIC Attempt 4 (180s elapsed) → Success ✓
+└─ Delete VNet → Success ✓
+
+Client: GET /api/spokes/2 (poll for status)
+└─ Response: {"deployment_status": "rolled_back", ...}
+```
+
+**Client Usage Pattern:**
+```bash
+# 1. Try deployment
+curl -X POST http://localhost:5001/api/spokes -d '{"spoke_id": 2, ...}'
+# Response: "rollback_status": "queued"
+
+# 2. Wait a bit, then check status
+sleep 10
+curl http://localhost:5001/api/spokes/2
+# Response: "deployment_status": "rolling_back"
+
+# 3. Wait for rollback to complete (3-5 min for NIC reservation)
+sleep 180
+curl http://localhost:5001/api/spokes/2
+# Response: "deployment_status": "rolled_back" (success!)
+```
+
+### Error Handling Features
+
+- **Graceful Degradation**: Rollback continues even if some resources fail
+- **Detailed Error Messages**: Each failure includes resource name and error details
+- **Storage Persistence**: Failed deployments and rollback errors are saved to storage for visibility
+- **Retry Logic**: Automatic retries for transient Azure API failures
+- **Partial Deployment Cleanup**: Detects and cleans up orphan resources from partial deployments
+- **Rollback Status Tracking**: Deployment status shows whether rollback succeeded, failed, or completed with warnings
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+#### 1. Rollback Fails - NIC Deletion
+**Problem**: "NIC rollback: Failed to delete spoke-vm-X-nic"
+
+**Root Cause**: When a VM deployment fails (e.g., quota exceeded), Azure reserves the NIC for **180 seconds** to prevent race conditions. This is an Azure platform behavior.
+
+**Solution**: The system now includes:
+- 15-second wait after VM deletion
+- Up to 5 retry attempts with exponential backoff (60s wait between retries)
+- Specific detection of "NicReservedForAnotherVm" error
+- Specific detection of "NIC in use" errors
+- Automatic orphan NIC detection for partial deployments
+
+**Timeline**:
+- Attempt 1: Immediate (fails with NicReservedForAnotherVm)
+- Attempt 2: After 60 seconds
+- Attempt 3: After 60 seconds (total 120s elapsed)
+- Attempt 4: After 60 seconds (total 180s elapsed - should succeed)
+- Attempt 5: After 60 seconds (fallback)
+
+If rollback still fails, the deployment status will show detailed error messages. You can:
+1. Check deployment status: `GET /api/spokes/<id>`
+2. Wait 3-5 minutes for Azure's NIC reservation to expire
+3. Retry deletion: `DELETE /api/spokes/<id>`
+
+#### 1b. Partial Deployment with Orphan Resources
+**Problem**: Deployment fails (e.g., quota exceeded) and leaves VNet/NIC resources
+
+**How Fixed**: The rollback logic now checks for orphan resources even if they weren't marked as "completed" steps. For example:
+- VNet creation completed ✅
+- NIC creation started but not marked complete ⚠️
+- VM creation failed due to quota ❌
+- Rollback will detect and delete the orphan NIC + VNet
+
+**Visibility**: Failed deployments are saved with full error details including rollback status.
+
+#### 2. Cannot SSH to VM
+**Problem**: "No line of sight to private IP address"
+
+**Solution**: VMs are deployed with private IPs only. To connect:
+- Use Azure Bastion (recommended)
+- Set up VPN Gateway
+- Deploy a jump box with public IP
+- Use Azure Cloud Shell
+
+#### 3. VM Deployment Timeout
+**Problem**: VM creation takes too long
+
+**Solution**: VM deployment can take 5-10 minutes. The system waits up to 10 minutes. Check Azure Portal for VM status.
 
 ---
 

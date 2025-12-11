@@ -8,6 +8,7 @@ all Azure services (Network, Compute, Application Gateway).
 from typing import Optional, Dict, Any
 from datetime import datetime
 from azure.identity import ClientSecretCredential
+import threading
 
 from config.settings import settings
 from utils.logger import get_logger, LogContext
@@ -213,8 +214,11 @@ class SpokeOrchestrator:
 
                 # Mark deployment as successful
                 deployment_status.status = DeploymentStatusEnum.COMPLETED
-                deployment_status.vm_private_ip = vm_private_ip
+                deployment_status.vnet_name = vnet.name
                 deployment_status.vnet_id = vnet.id
+                deployment_status.vm_name = spoke_config.vm_name
+                deployment_status.vm_id = vm.id
+                deployment_status.vm_private_ip = vm_private_ip
                 deployment_status.backend_pool_name = spoke_config.backend_pool_name
                 deployment_status.routing_rule_name = spoke_config.routing_rule_name
                 deployment_status.completed_at = datetime.now()
@@ -243,14 +247,26 @@ class SpokeOrchestrator:
 
                 self.logger.error(f"❌ Spoke {spoke_id} deployment failed: {str(e)}")
 
-                # Attempt rollback if enabled
+                # Trigger asynchronous rollback if enabled (ALWAYS runs in background)
                 if self.settings.ENABLE_ROLLBACK:
-                    self.logger.warning("🔄 Attempting rollback...")
-                    try:
-                        self.rollback_spoke(spoke_config, deployment_status)
-                    except Exception as rollback_error:
-                        self.logger.error(f"Rollback failed: {rollback_error}")
-                        deployment_status.error_message += f" | Rollback error: {str(rollback_error)}"
+                    self.logger.warning("🔄 Queueing asynchronous rollback in background...")
+
+                    # Update status to rolling_back
+                    deployment_status.status = DeploymentStatusEnum.ROLLING_BACK
+                    self.storage_service.save_deployment(deployment_status)
+
+                    # Start rollback in background thread (daemon=True means it won't block app shutdown)
+                    rollback_thread = threading.Thread(
+                        target=self._async_rollback_wrapper,
+                        args=(spoke_config, deployment_status),
+                        daemon=True,
+                        name=f"rollback-spoke-{spoke_id}"
+                    )
+                    rollback_thread.start()
+
+                    self.logger.info(f"✓ Rollback queued in background thread. Check status: GET /api/spokes/{spoke_id}")
+                else:
+                    self.logger.warning("⚠️  Rollback disabled (ENABLE_ROLLBACK=False). Resources may remain orphaned.")
 
                 raise DeploymentException(spoke_id, "deployment", str(e))
 
@@ -321,6 +337,44 @@ class SpokeOrchestrator:
         self.logger.debug("Configuration validated successfully")
         return True
 
+    def _async_rollback_wrapper(
+        self,
+        spoke_config: SpokeConfiguration,
+        deployment_status: DeploymentStatus
+    ):
+        """
+        Wrapper for async rollback execution in background thread
+
+        This method runs in a separate thread and handles all exceptions
+        to prevent thread crashes. It updates deployment status in storage
+        after rollback completes (success or failure).
+
+        Args:
+            spoke_config: Spoke configuration
+            deployment_status: Current deployment status
+        """
+        spoke_id = spoke_config.spoke_id
+
+        with LogContext(spoke_id=spoke_id):
+            try:
+                self.logger.info(f"🔄 Background rollback started for spoke {spoke_id}")
+
+                # Perform the actual rollback
+                success = self.rollback_spoke(spoke_config, deployment_status)
+
+                if success:
+                    self.logger.info(f"✅ Background rollback completed successfully for spoke {spoke_id}")
+                else:
+                    self.logger.error(f"❌ Background rollback completed with errors for spoke {spoke_id}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Background rollback failed for spoke {spoke_id}: {str(e)}", exc_info=True)
+
+                # Update deployment status with rollback error
+                deployment_status.status = DeploymentStatusEnum.ROLLBACK_FAILED
+                deployment_status.error_message = f"{deployment_status.error_message} | Async rollback error: {str(e)}"
+                self.storage_service.save_deployment(deployment_status)
+
     def rollback_spoke(
         self,
         spoke_config: SpokeConfiguration,
@@ -362,58 +416,110 @@ class SpokeOrchestrator:
                     except Exception as e:
                         rollback_errors.append(f"AGW rollback: {str(e)}")
 
-                # Rollback VM
+                # Rollback VM (must be done before NIC)
+                vm_deleted = False
                 if "deploy_vm" in completed_steps:
                     self.logger.info("Rolling back virtual machine")
                     try:
-                        self.compute_service.delete_vm(spoke_config.vm_name)
+                        vm_deleted = self.compute_service.delete_vm(spoke_config.vm_name)
+                        if not vm_deleted:
+                            self.logger.error(f"VM {spoke_config.vm_name} deletion returned False")
+                            rollback_errors.append(f"VM rollback: Failed to delete {spoke_config.vm_name}")
                     except Exception as e:
                         rollback_errors.append(f"VM rollback: {str(e)}")
 
                     # Delete OS disk (VM deletion doesn't auto-delete managed disks)
-                    try:
-                        disk_name = f"{spoke_config.vm_name}-osdisk"
-                        self.logger.info(f"Rolling back OS disk: {disk_name}")
-                        self.compute_service.delete_disk(disk_name)
-                    except Exception as e:
-                        rollback_errors.append(f"Disk rollback: {str(e)}")
+                    # Only attempt if VM was deleted successfully
+                    if vm_deleted:
+                        try:
+                            disk_name = f"{spoke_config.vm_name}-osdisk"
+                            self.logger.info(f"Rolling back OS disk: {disk_name}")
+                            self.compute_service.delete_disk(disk_name)
+                        except Exception as e:
+                            rollback_errors.append(f"Disk rollback: {str(e)}")
 
-                # Rollback NIC
+                # Rollback NIC (can only be deleted after VM is fully deleted)
                 nic_deleted = False
+                nic_name = generate_nic_name(spoke_config.vm_name)
+
+                # Check if NIC was created (either in completed steps or might exist from failed deployment)
                 if "create_nic" in completed_steps:
-                    self.logger.info("Rolling back network interface")
+                    # Only attempt NIC deletion if VM was deleted successfully or didn't exist
+                    if "deploy_vm" in completed_steps and not vm_deleted:
+                        self.logger.warning("Skipping NIC deletion because VM deletion failed")
+                        rollback_errors.append("NIC rollback: Skipped due to VM deletion failure")
+                    else:
+                        # Wait a bit for Azure to fully release the NIC after VM deletion
+                        if "deploy_vm" in completed_steps and vm_deleted:
+                            import time
+                            self.logger.info("Waiting 15 seconds for Azure to release NIC after VM deletion...")
+                            time.sleep(15)
+
+                        self.logger.info("Rolling back network interface")
+                        try:
+                            # Use more retries to handle Azure's 180s NIC reservation after failed VM creation
+                            nic_deleted = self.compute_service.delete_nic(nic_name, max_retries=5)
+                            if not nic_deleted:
+                                self.logger.error(f"NIC {nic_name} deletion returned False")
+                                rollback_errors.append(f"NIC rollback: Failed to delete {nic_name}. Azure may still be holding NIC reservation (180s). Wait and try DELETE /api/spokes/{spoke_id} again.")
+                        except Exception as e:
+                            rollback_errors.append(f"NIC rollback: {str(e)}")
+                else:
+                    # If NIC creation wasn't marked as completed, check if NIC exists anyway
+                    # (VM might have failed before NIC step was marked complete)
+                    self.logger.info(f"NIC creation not in completed steps, checking if {nic_name} exists...")
                     try:
-                        nic_name = generate_nic_name(spoke_config.vm_name)
-                        nic_deleted = self.compute_service.delete_nic(nic_name)
-                        if not nic_deleted:
-                            self.logger.error(f"NIC {nic_name} deletion returned False")
-                            rollback_errors.append(f"NIC rollback: Failed to delete {nic_name}")
+                        if self.compute_service._nic_exists(nic_name):
+                            self.logger.warning(f"Found orphan NIC {nic_name}, attempting deletion...")
+                            # Use more retries to handle Azure's 180s NIC reservation
+                            nic_deleted = self.compute_service.delete_nic(nic_name, max_retries=5)
+                            if not nic_deleted:
+                                self.logger.error(f"Orphan NIC {nic_name} deletion returned False")
+                                rollback_errors.append(f"NIC rollback: Failed to delete orphan {nic_name}. Azure may still be holding NIC reservation (180s). Wait and try DELETE /api/spokes/{spoke_id} again.")
+                        else:
+                            self.logger.info(f"NIC {nic_name} does not exist, skipping deletion")
+                            nic_deleted = True  # Consider it as successfully handled
                     except Exception as e:
-                        rollback_errors.append(f"NIC rollback: {str(e)}")
+                        self.logger.warning(f"Could not check/delete orphan NIC: {str(e)}")
+                        # Don't add to rollback_errors if NIC doesn't exist
+                        nic_deleted = True
 
                 # Rollback VNet (this also removes subnets and peering)
                 # Only attempt if NIC was deleted successfully or didn't need to be deleted
                 if "create_vnet" in completed_steps:
-                    if "create_nic" in completed_steps and not nic_deleted:
-                        self.logger.warning("Skipping VNet deletion because NIC deletion failed")
-                        rollback_errors.append("VNet rollback: Skipped due to NIC deletion failure")
-                    else:
-                        self.logger.info("Rolling back VNet")
-                        try:
-                            # Use actual VNet name from config
-                            vnet_name = spoke_config.vnet_name if spoke_config.vnet_name else generate_vnet_name(spoke_id)
-                            self.network_service.delete_spoke_vnet(vnet_name)
-                        except Exception as e:
+                    if not nic_deleted:
+                        # Try to delete VNet anyway, but warn that NIC might be blocking it
+                        self.logger.warning("Attempting VNet deletion despite NIC issues - may fail if NIC still attached")
+
+                    self.logger.info("Rolling back VNet")
+                    try:
+                        # Use actual VNet name from config
+                        vnet_name = spoke_config.vnet_name if spoke_config.vnet_name else generate_vnet_name(spoke_id)
+                        self.network_service.delete_spoke_vnet(vnet_name)
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "InUseSubnetCannotBeDeleted" in error_msg or "InUse" in error_msg:
+                            rollback_errors.append(f"VNet rollback: Cannot delete - resources still in use (NIC: {nic_name} may still be attached)")
+                        else:
                             rollback_errors.append(f"VNet rollback: {str(e)}")
 
                 if rollback_errors:
                     error_msg = f"Rollback completed with errors: {'; '.join(rollback_errors)}"
                     self.logger.error(error_msg)
                     deployment_status.status = DeploymentStatusEnum.ROLLBACK_FAILED
+                    deployment_status.error_message = f"{deployment_status.error_message} | Rollback errors: {'; '.join(rollback_errors)}"
+
+                    # Save deployment status with rollback errors for visibility
+                    self.storage_service.save_deployment(deployment_status)
+
                     raise RollbackError(spoke_id, "rollback", error_msg)
 
                 self.logger.info(f"✓ Rollback completed successfully for spoke {spoke_id}")
                 deployment_status.status = DeploymentStatusEnum.ROLLED_BACK
+
+                # Save successful rollback status
+                self.storage_service.save_deployment(deployment_status)
+
                 return True
 
             except Exception as e:

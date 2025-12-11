@@ -60,11 +60,26 @@ def create_spoke():
         }), 201
 
     except ValueError as e:
-        logger.warning(f"Validation error: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 400
+        error_msg = str(e)
+        logger.warning(f"Validation/Deployment error: {error_msg}")
+
+        # Check if this is a deployment failure (not validation)
+        if 'Deployment failed' in error_msg:
+            # Extract spoke_id from request data for rollback status info
+            spoke_id = data.get('spoke_id') if data else None
+
+            return jsonify({
+                'status': 'error',
+                'message': error_msg,
+                'rollback_status': 'queued',
+                'note': f'Automatic rollback is running in background. Check status: GET /api/spokes/{spoke_id}' if spoke_id else 'Automatic rollback queued in background.'
+            }), 500
+        else:
+            # Regular validation error
+            return jsonify({
+                'status': 'error',
+                'message': error_msg
+            }), 400
 
     except Exception as e:
         logger.error(f"Error creating spoke: {e}", exc_info=True)
@@ -135,8 +150,14 @@ def list_spokes():
     List all deployed spokes
 
     Query Parameters:
-        status: Filter by status (optional)
+        status: Filter by deployment status (optional)
+                Valid values: 'completed', 'failed', 'in_progress', 'pending', 'rolling_back'
         limit: Maximum number of results (optional)
+
+    Examples:
+        GET /api/spokes
+        GET /api/spokes?status=failed
+        GET /api/spokes?status=completed&limit=10
 
     Response:
     {
@@ -145,6 +166,7 @@ def list_spokes():
             {
                 "spoke_id": 1,
                 "exists": true,
+                "deployment_status": "completed",
                 "vnet": {...},
                 "vm": {...}
             },
