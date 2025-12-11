@@ -1,0 +1,52 @@
+services:
+  hub-spoke-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hub-spoke-automation
+    ports:
+      - "5000:5000"
+    environment:
+      # Azure credentials (load from .env file)
+      - AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+
+      # Azure resources
+      - RESOURCE_GROUP_NAME=${RESOURCE_GROUP_NAME}
+      - HUB_VNET_NAME=${HUB_VNET_NAME}
+      - HUB_VNET_RESOURCE_GROUP=${HUB_VNET_RESOURCE_GROUP}
+      - APPLICATION_GATEWAY_NAME=${APPLICATION_GATEWAY_NAME}
+      - AZURE_LOCATION=${AZURE_LOCATION}
+
+      # Flask configuration
+      - FLASK_ENV=${FLASK_ENV:-production}
+      - FLASK_DEBUG=${FLASK_DEBUG:-False}
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5000
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+    volumes:
+      # Mount logs directory for persistence
+      - ./logs:/app/logs
+      # Mount storage directory for deployment state
+      - ./storage:/app/storage
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    networks:
+      - hub-spoke-network
+
+networks:
+  hub-spoke-network:
+    driver: bridge

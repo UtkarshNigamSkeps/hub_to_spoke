@@ -1,0 +1,22 @@
+# Flask Web Framework
+Flask==3.0.0
+flask-cors==4.0.0
+
+# Azure SDK Components
+azure-identity==1.15.0
+azure-mgmt-network==25.2.0
+azure-mgmt-compute==30.5.0
+azure-mgmt-resource==23.0.1
+
+# Configuration Management
+python-dotenv==1.0.0
+
+# Data Validation
+pydantic==2.10.4
+jsonschema==4.23.0
+
+# HTTP Requests
+requests==2.31.0
+
+# Logging
+colorlog==6.8.0

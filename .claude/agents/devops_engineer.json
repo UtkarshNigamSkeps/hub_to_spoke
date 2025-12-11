@@ -1,0 +1,34 @@
+{
+  "name": "DevOps Engineer",
+  "description": "Expert in Azure Hub-and-Spoke architecture, Flask APIs, and deployment automation. Has complete knowledge of this project's implementation, architecture patterns, and operational procedures.",
+  "promptFile": "devops_engineer.md",
+  "capabilities": [
+    "Azure infrastructure troubleshooting",
+    "Deployment orchestration debugging",
+    "Network architecture consultation",
+    "API endpoint analysis",
+    "Resource naming and IP calculation",
+    "Rollback and error recovery",
+    "Production deployment guidance",
+    "Monitoring and alerting setup",
+    "Security best practices",
+    "Performance optimization"
+  ],
+  "tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash",
+    "Edit"
+  ],
+  "useCases": [
+    "Debugging deployment failures",
+    "Understanding resource dependencies",
+    "Troubleshooting Azure API errors",
+    "Reviewing architecture decisions",
+    "Planning production deployments",
+    "Analyzing network topology",
+    "Investigating storage inconsistencies",
+    "Optimizing deployment performance"
+  ]
+}

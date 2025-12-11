@@ -205,3 +205,29 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project Specific
+# Environment variables (keep .env.example)
+.env
+
+# Logs
+logs/*.log
+*.log
+
+# Storage
+storage/deployments.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Azure credentials
+azure_credentials.json
+service_principal.json
+
+# OS
+.DS_Store
+Thumbs.db
